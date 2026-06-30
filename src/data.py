@@ -1,28 +1,72 @@
+"""data.py — Synthetic insurance policy data for ClaimsPredict (Xceedance).
+
+Policy-level data with exposure, claim count, claim amount, and rating
+factors (vehicle type, driver age, territory, coverage). This mirrors
+the structure of real auto insurance data used in GLM pricing.
+
+The frequency-severity decomposition is the standard actuarial approach:
+  * Claim **frequency** (count per unit exposure) → Poisson GLM
+  * Claim **severity** (average amount per claim) → Gamma GLM
+  * **Pure premium** = frequency × severity
+"""
 from __future__ import annotations
 import numpy as np
 import pandas as pd
+from typing import Any
 
-FEATURE_NAMES = ["policy_age_months", "claim_amount", "claimant_age", "num_prior_claims", "incident_severity", "fraud_score", "policy_type", "region", "settlement_delay_days", "legal_representation"]
-CATEGORICAL_FEATURES = ["policy_type", "region", "legal_representation"]
-NUMERICAL_FEATURES = ["policy_age_months", "claim_amount", "claimant_age", "num_prior_claims", "incident_severity", "fraud_score", "settlement_delay_days"]
 
-def make_synthetic(n=10000, seed=42):
+def make_synthetic(n: int = 5000, seed: int = 42) -> dict[str, Any]:
+    """Generate synthetic auto insurance policy data.
+
+    Rating factors: vehicle_type, driver_age_group, territory, coverage_level.
+    Frequency depends on driver age and territory. Severity depends on
+    vehicle type and coverage level.
+    """
     rng = np.random.default_rng(seed)
+
+    vehicle_type = rng.choice(["sedan", "suv", "truck", "sports"], n, p=[0.35, 0.30, 0.20, 0.15])
+    driver_age = rng.choice(["18-25", "26-40", "41-60", "60+"], n, p=[0.15, 0.35, 0.35, 0.15])
+    territory = rng.choice(["urban", "suburban", "rural"], n, p=[0.40, 0.40, 0.20])
+    coverage = rng.choice(["basic", "standard", "premium"], n, p=[0.25, 0.50, 0.25])
+    exposure = rng.uniform(0.5, 1.0, n).round(3)
+
+    # Frequency: young + urban = more claims, rural = fewer
+    base_freq = np.full(n, 0.10)
+    age_effect = {"18-25": 1.8, "26-40": 1.0, "41-60": 0.7, "60+": 0.9}
+    terr_effect = {"urban": 1.5, "suburban": 1.0, "rural": 0.6}
+    freq_rate = base_freq * np.array([age_effect[a] for a in driver_age]) * \
+                np.array([terr_effect[t] for t in territory])
+    claim_count = rng.poisson(freq_rate * exposure).astype(int)
+
+    # Severity: sports + premium = higher claims
+    base_sev = 3000
+    veh_effect = {"sedan": 1.0, "suv": 1.2, "truck": 1.1, "sports": 1.8}
+    cov_effect = {"basic": 0.7, "standard": 1.0, "premium": 1.5}
+    sev_rate = base_sev * np.array([veh_effect[v] for v in vehicle_type]) * \
+               np.array([cov_effect[c] for c in coverage])
+    claim_amount = np.zeros(n)
+    has_claim = claim_count > 0
+    claim_amount[has_claim] = rng.gamma(
+        shape=3.0, scale=sev_rate[has_claim] / 3.0
+    ).round(2)
+
     df = pd.DataFrame({
-        "policy_age_months": rng.gamma(shape=3, scale=12, size=n).clip(1, 120).astype(int),
-        "claim_amount": rng.lognormal(mean=8.5, sigma=1.2, size=n).clip(500, 200000).astype(int),
-        "claimant_age": rng.normal(42, 15, size=n).clip(18, 85).astype(int),
-        "num_prior_claims": rng.poisson(lam=0.5, size=n).clip(0, 6),
-        "incident_severity": rng.uniform(1, 10, size=n).round(2),
-        "fraud_score": rng.uniform(0, 100, size=n).round(1),
-        "policy_type": rng.choice(["auto", "health", "home", "life"], size=n, p=[0.35, 0.25, 0.20, 0.20]),
-        "region": rng.choice(["northeast", "southeast", "midwest", "west"], size=n, p=[0.25, 0.28, 0.22, 0.25]),
-        "settlement_delay_days": rng.exponential(scale=30, size=n).clip(0, 365).astype(int),
-        "legal_representation": rng.choice(["yes", "no"], size=n, p=[0.35, 0.65]),
+        "vehicle_type": vehicle_type, "driver_age_group": driver_age,
+        "territory": territory, "coverage_level": coverage,
+        "exposure": exposure, "claim_count": claim_count,
+        "claim_amount": claim_amount,
     })
-    severity = df["incident_severity"] / 10; fraud = df["fraud_score"] / 100; claims = np.clip(df["num_prior_claims"], 0, 3) / 3
-    delay = np.clip(df["settlement_delay_days"] / 180, 0, 1); legal = (df["legal_representation"] == "yes").astype(int)
-    log_odds = -2.0 + 0.5 * severity + 0.8 * fraud + 0.3 * claims + 0.4 * delay + 0.3 * legal + rng.normal(0, 0.5, size=n)
-    prob = 1 / (1 + np.exp(-log_odds))
-    y = (prob > np.percentile(prob, 78)).astype(np.float64)
-    return {"X": df, "y": y, "features": FEATURE_NAMES, "df": df.assign(claim_disputed=y), "categorical_features": CATEGORICAL_FEATURES, "numerical_features": NUMERICAL_FEATURES, "n_samples": n, "n_features": len(FEATURE_NAMES), "positive_rate": y.mean()}
+
+    return {
+        "df": df,
+        "features": ["vehicle_type", "driver_age_group", "territory", "coverage_level"],
+        "categorical_features": ["vehicle_type", "driver_age_group", "territory", "coverage_level"],
+        "numerical_features": ["exposure"],
+        "target_count": "claim_count",
+        "target_amount": "claim_amount",
+        "exposure": "exposure",
+        "n_samples": n,
+        "claim_frequency": float(claim_count.sum() / exposure.sum()),
+        "claim_severity": float(claim_amount[has_claim].mean()) if has_claim.any() else 0.0,
+        "loss_ratio": float(claim_amount.sum() / (exposure * 1000).sum()),  # rough premium proxy
+    }
